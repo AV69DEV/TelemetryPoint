@@ -1,5 +1,6 @@
 #!python3
 from ctypes import wintypes
+from dataclasses import dataclass
 from http import HTTPStatus
 import http.client
 import re
@@ -370,9 +371,7 @@ class winApiInterface:
             f"Unexpected WaitForSingleObject result: {result}"
         )
         
-
-        
-        
+     
     def setup(self):
         self.WAIT_FOR_SINGLE_OBJECT_RESULTS: dict[str, int] = {
                     "WAIT_OBJECT_0": 0x00000000,
@@ -403,6 +402,10 @@ class winApiInterface:
         self.close_handle.argtypes = (wintypes.HANDLE,)
         self.close_handle.restype = wintypes.BOOL
 
+@dataclass(frozen = True)
+class BufferSnapshot:
+    tick_count: int
+    data: bytes
 
 class IRSDKStruct:
     @classmethod
@@ -462,7 +465,7 @@ class VarBuffer(IRSDKStruct):
     def __init__(self, *args, buf_len, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_memory_frozen = False
-        self._frozen_memory = None
+        self._frozen_memory: bytes | None = None
         self._buf_len = buf_len
 
     def freeze(self):
@@ -499,6 +502,7 @@ class DiskSubHeader(IRSDKStruct):
 class IRSDK:
     def __init__(self, parse_yaml_async=False):
         self.win_api = winApiInterface()
+        self.last_tick: int | None = None
         self.parse_yaml_async = parse_yaml_async
         self.is_initialized = False
         self.last_session_info_update = 0
@@ -528,6 +532,61 @@ class IRSDK:
             return res[0] if var_header.count == 1 else list(res)
 
         return self._get_session_info(key)
+
+    def get_value_from_buffer_snapshot(self, snapshot: BufferSnapshot, field_name: str) -> Any:
+        try:
+            var_header = self._var_headers_dict[field_name]
+        except KeyError:
+            raise KeyError(
+                f"Unknown iRacing telemetry field: {field_name}"
+            ) from None
+
+        result = struct.unpack_from(
+            VAR_TYPE_MAP[var_header.type] * var_header.count,
+            snapshot.data,
+            var_header.offset
+        )
+        return result[0] if var_header.count == 1 else list(result)
+
+    def wait_for_new_tick(self, timeout_ms: int = 32) -> BufferSnapshot | None:
+        if not self.is_initialized:
+            raise RuntimeError("IRSDK is not initialized")
+
+        if self._data_valid_event is None:
+            raise RuntimeError("Data valid event is not open")
+        
+        signal = self.win_api.get_data_valid_event_status(self._data_valid_event, timeout_ms)
+        if not signal:
+            return None
+       
+        var_buf_newest = self._var_buffer_newest
+        tick_before_freeze = var_buf_newest.tick_count
+
+        if tick_before_freeze == self.last_tick:
+            return None
+        
+        var_buf_newest.freeze()
+
+        try:
+            tick_after_freeze = var_buf_newest.tick_count
+
+            if tick_after_freeze != tick_before_freeze:
+                return None
+
+            self.last_tick = tick_after_freeze
+
+            snapshot_data = var_buf_newest.get_memory()
+
+            if not isinstance(snapshot_data, bytes):
+                raise RuntimeError("Expected frozen telemetry buffer")
+
+            return BufferSnapshot(
+                tick_count = tick_after_freeze,
+                data = snapshot_data,
+            )
+        finally:
+            var_buf_newest.unfreeze()
+
 
     @property
     def is_connected(self):
@@ -596,6 +655,7 @@ class IRSDK:
     def shutdown(self):
         self.is_initialized = False
         self.last_session_info_update = 0
+        self.last_tick = None
 
         if self._shared_mem:
             try: 
@@ -689,15 +749,25 @@ class IRSDK:
 
     @property
     def _var_buffer_latest(self):
-        # return the frozen var buffer if exists
+        """Actually returns second latest buffer - use _var_buffer_newest() to get actually newest/latest buffer
+        return the frozen var buffer if exists
+        otherwise return 2nd most recent var buffer
+        because it might be a situation (with most recent var buffer)
+        that half of var buffer written with new data
+        and other half still old"""
         if self.__var_buffer_latest:
             return self.__var_buffer_latest
-        # otherwise return 2nd most recent var buffer
-        # because it might be a situation (with most recent var buffer)
-        # that half of var buffer written with new data
-        # and other half still old
+       
         i = max(0, min(self._header.num_buf - 1, 1))
         return sorted(self._header.var_buf, key=lambda v: v.tick_count, reverse=True)[i]
+
+    @property
+    def _var_buffer_newest(self):
+        """Return the newest live buffer by tick count."""
+        return max(
+            self._header.var_buf,
+            key=lambda buffer: buffer.tick_count,
+        )
 
     @property
     def _var_headers(self):
