@@ -434,7 +434,7 @@ class IRSDKStruct:
 
 class Header(IRSDKStruct):
     version = IRSDKStruct.property_value(0, 'i')
-    status = IRSDKStruct.property_value(4, 'i')    # bitfield using StatusField
+    status = IRSDKStruct.property_value(4, 'i')   # bitfield using StatusField
     tick_rate = IRSDKStruct.property_value(8, 'i') # ticks per second (60 or 360 etc)
 
     session_info_update = IRSDKStruct.property_value(12, 'i') # incremented when session info changes
@@ -817,6 +817,9 @@ class IRSDK:
             return self.__session_info_dict[key]['update']
         return None
 
+    def get_session_info_section(self, key: str):
+        self._get_session_info(key)
+
     def _get_session_info(self, key):
         if self.last_session_info_update < self._header.session_info_update:
             self.last_session_info_update = self._header.session_info_update
@@ -986,7 +989,7 @@ class IBT:
         self.__var_headers = None
         self.__var_headers_dict = None
         self.__var_headers_names = None
-        self.__session_info_dict = None
+        self.__session_info_dict: dict[str, Any] | None = None
 
     def get(self, index, key):
         if not self._header:
@@ -1017,6 +1020,39 @@ class IBT:
             return results
         return None
 
+    def get_session_info(self) -> dict[str, Any]:
+        if self.__session_info_dict is None:
+            if self._header is None or self._shared_mem is None:
+                raise RuntimeError("IBT file is not open")
+
+            start = self._header.session_info_offset
+            end = start + self._header.session_info_len
+            raw_yaml = self._shared_mem[start:end].rstrip(b"\0")
+
+            try:
+                parsed_yaml = yaml.safe_load(raw_yaml.decode("utf-8")) or {}
+            except (UnicodeDecodeError, yaml.YAMLError) as error:
+                raise RuntimeError("Failed to parse IBT session YAML") from error
+
+            if not isinstance(parsed_yaml, dict):
+                raise RuntimeError("IBT session YAML root must be a mapping")
+
+            self.__session_info_dict = parsed_yaml
+
+        return self.__session_info_dict
+
+    def get_session_info_section(self, key: str) -> dict[str, Any] | None:
+        section = self.get_session_info().get(key)
+
+        if section is None:
+            return None
+
+        if not isinstance(section, dict):
+            raise RuntimeError(f"Session-info section {key!r} must be a mapping")
+
+        return section
+
+        
     @property
     def _var_headers(self):
         if not self._header:
