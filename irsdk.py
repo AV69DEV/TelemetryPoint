@@ -818,7 +818,7 @@ class IRSDK:
         return None
 
     def get_session_info_section(self, key: str):
-        self._get_session_info(key)
+        return self._get_session_info(key)
 
     def _get_session_info(self, key):
         if self.last_session_info_update < self._header.session_info_update:
